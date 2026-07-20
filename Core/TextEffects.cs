@@ -1,7 +1,9 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -1046,26 +1048,147 @@ public class DynamicColorText
 
 // ── Rust Native Bridge ──
 // Replaces Unity IJobParallelFor structs with native Rust rayon-parallelized compute.
-// The native DLL (text_effects_rs.dll) is preloaded by Main.cs OnLoad() via LoadLibrary.
+// The native DLL (text_effects_rs.dll) is preloaded via TextEffectsNative.Preload() — multi-stage: assembly-adjacent → dataPath → embedded resource extraction.
 
 public static unsafe class TextEffectsNative
 {
     private static bool _preloaded;
 
-    /// <summary>Call once at startup with the mod's root path.</summary>
-    public static void Preload(string modPath)
-    {
-        if (_preloaded) return;
-        string dllPath = modPath + "\\lib\\text_effects_rs.dll";
-        if (System.IO.File.Exists(dllPath))
-        {
-            LoadLibrary(dllPath);
-            _preloaded = true;
-        }
-    }
+    // LoadLibraryEx flags
+    private const uint LOAD_LIBRARY_AS_DATAFILE = 0x00000002;
+
+    [DllImport("kernel32", SetLastError = true)]
+    private static extern IntPtr LoadLibraryEx(string lpFileName, IntPtr hFile, uint dwFlags);
+
+    [DllImport("kernel32", SetLastError = true)]
+    private static extern bool FreeLibrary(IntPtr hModule);
 
     [DllImport("kernel32", SetLastError = true)]
     private static extern IntPtr LoadLibrary(string lpFileName);
+
+    /// <summary>
+    /// Validate + load a native DLL.  Uses LoadLibraryEx(LOAD_AS_DATAFILE) to
+    /// verify the PE header without calling DllMain, so a broken/corrupt DLL
+    /// does not crash the process.  Only then calls LoadLibrary for real.
+    /// </summary>
+    private static bool TryLoad(string dllPath)
+    {
+        if (!File.Exists(dllPath))
+            return false;
+
+        Debug.Log($"[TextEffectsNative] Stage — trying: {dllPath}");
+
+        // Pre-validate the PE image without executing DllMain
+        IntPtr hTest = LoadLibraryEx(dllPath, IntPtr.Zero, LOAD_LIBRARY_AS_DATAFILE);
+        if (hTest == IntPtr.Zero)
+        {
+            Debug.LogWarning($"[TextEffectsNative] Skipping invalid DLL: {dllPath}");
+            return false;
+        }
+        FreeLibrary(hTest);
+
+        // Load for real (calls DllMain)
+        try
+        {
+            if (LoadLibrary(dllPath) == IntPtr.Zero)
+            {
+                Debug.LogWarning($"[TextEffectsNative] LoadLibrary failed for: {dllPath}");
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[TextEffectsNative] LoadLibrary exception: {ex.Message}");
+            return false;
+        }
+
+        _preloaded = true;
+        Debug.Log($"[TextEffectsNative] Loaded: {dllPath}");
+        return true;
+    }
+
+    /// <summary>
+    /// Multi-stage load for text_effects_rs.dll:
+    /// 1. Assembly-adjacent (legacy / direct mod load).
+    /// 2. Application.dataPath/FishUtility/ (Updater download target).
+    /// 3. Embedded resource → extract to Application.dataPath/FishUtility/ (when FishUtility is packaged as a DLL).
+    /// </summary>
+    public static void Preload()
+    {
+        if (_preloaded) return;
+
+        // Stage 1: next to the assembly (backward compat)
+        string dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+        if (!string.IsNullOrEmpty(dir) && TryLoad(Path.Combine(dir, "text_effects_rs.dll")))
+            return;
+
+        // Stage 2: Application.dataPath/FishUtility/ (Updater / previously extracted)
+        string fishUtilDir = Path.Combine(Application.dataPath, "FishUtility");
+        string targetPath = Path.Combine(fishUtilDir, "text_effects_rs.dll");
+        if (TryLoad(targetPath))
+            return;
+
+        // Stage 3: extract from embedded resources
+        try
+        {
+            var asm = Assembly.GetExecutingAssembly();
+
+            // Most-likely resource names first (CscBuilder embeds by file name only)
+            string[] preferred =
+            {
+                "text_effects_rs.dll",
+                "FishUtility.lib.text_effects_rs.dll",
+                "FishUtility.text_effects_rs.dll",
+            };
+
+            foreach (var name in preferred)
+            {
+                if (ExtractAndLoad(asm, name, targetPath, fishUtilDir))
+                    return;
+            }
+
+            // Fallback: scan all embedded resources for *text_effects_rs.dll
+            foreach (var name in asm.GetManifestResourceNames())
+            {
+                if (name.EndsWith("text_effects_rs.dll", StringComparison.OrdinalIgnoreCase)
+                    && ExtractAndLoad(asm, name, targetPath, fishUtilDir))
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[TextEffectsNative] Failed to extract embedded text_effects_rs.dll: {ex.Message}");
+        }
+
+        Debug.LogError("[TextEffectsNative] Could not load text_effects_rs.dll from any source.");
+    }
+
+    private static bool ExtractAndLoad(
+        Assembly asm,
+        string resourceName,
+        string targetPath,
+        string fishUtilDir)
+    {
+        using (var stream = asm.GetManifestResourceStream(resourceName))
+        {
+            if (stream == null) return false;
+
+            Directory.CreateDirectory(fishUtilDir);
+
+            // Write to temp file first so the handle is closed before LoadLibrary
+            string tmpPath = targetPath + ".tmp";
+            using (var fs = File.Create(tmpPath))
+                stream.CopyTo(fs);
+
+            if (File.Exists(targetPath))
+                File.Delete(targetPath);
+            File.Move(tmpPath, targetPath);
+
+            Debug.Log($"[TextEffectsNative] Extracted embedded resource '{resourceName}' → {targetPath}");
+        }
+
+        return TryLoad(targetPath);
+    }
 
     [DllImport("text_effects_rs", CallingConvention = CallingConvention.Cdecl)]
     public static extern void rs_batch_srgb_to_oklab(
@@ -1178,6 +1301,7 @@ public class DynamicColorTextEffect : IDisposable
         }
     }
     public bool AutoDisposeWhenEmpty { get; set; } = false;
+    internal bool IsLayoutDirty => _layoutDirty;
     private struct GlobalVertData
     {
         public TMP_Text Text;
@@ -1249,6 +1373,11 @@ public class DynamicColorTextEffect : IDisposable
         {
             if (ReferenceEquals(obj, t))
             {
+                // Any text change alters the TMP mesh vertex count, which
+                // changes the colors32 array size — the persistent mesh
+                // color arrays MUST be rebuilt to match, otherwise
+                // NativeArray<Color32>.Copy corrupts memory.
+                _layoutDirty = true;
                 int chars = 0, lines = 0;
                 foreach (var tx in _texts)
                 {
@@ -1256,15 +1385,8 @@ public class DynamicColorTextEffect : IDisposable
                     chars += tx.textInfo.characterCount;
                     lines += tx.textInfo.lineCount;
                 }
-                bool linesChanged = lines != _lastTotalLines;
-                bool charsDrastic = _lastTotalChars == 0
-                    || Math.Abs(chars - _lastTotalChars) > _lastTotalChars * 0.2f;
-                if (linesChanged || charsDrastic)
-                {
-                    _lastTotalChars = chars;
-                    _lastTotalLines = lines;
-                    _layoutDirty = true;
-                }
+                _lastTotalChars = chars;
+                _lastTotalLines = lines;
                 return;
             }
         }
@@ -1353,7 +1475,10 @@ public class DynamicColorTextEffect : IDisposable
         {
             var t = _texts[i];
             if (t == null)
+            {
                 _texts.RemoveAt(i);
+                continue;
+            }
             t.ForceMeshUpdate();
         }
         if (_texts.Count == 0)
@@ -2189,8 +2314,18 @@ public class DynamicColorTextEffectManager : MonoBehaviour
         if (_nextUpdateTime < 0.0001)
             _nextUpdateTime = currentTime;
 
+        // When any effect has a dirty layout (e.g. text just changed via
+        // OnTextChanged), bypass the frame-rate throttle so colors are
+        // applied in the current frame with zero visual delay.
         if (currentTime < _nextUpdateTime)
-            return;
+        {
+            bool anyDirty = false;
+            for (int i = 0; i < _effects.Count; i++)
+            {
+                if (_effects[i]?.IsLayoutDirty == true) { anyDirty = true; break; }
+            }
+            if (!anyDirty) return;
+        }
 
         double timeBehind = currentTime - _nextUpdateTime;
         int framesToSkip = (int)(timeBehind / _updateInterval);
